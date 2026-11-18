@@ -1,10 +1,18 @@
 {
   "name": "dsh-metabolism",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "把每次上下文压缩前的原文归档进本地「茅房」：一天一个文件夹、一行一段，配索引与按时间加权的召回。",
   "license": "MIT",
   "author": "长命 (Changming) — 第一作者; 久安 (Jiuan)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/changmingjuebumaimeng3666/dsh-metabolism.git"
+  },
+  "homepage": "https://github.com/changmingjuebumaimeng3666/dsh-metabolism#readme",
+  "bugs": {
+    "url": "https://github.com/changmingjuebumaimeng3666/dsh-metabolism/issues"
+  },
   "exports": {
     ".": "./index.js",
     "./engine": "./engine.js",
