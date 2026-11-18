@@ -1,0 +1,47 @@
+{
+  "name": "dsh-metabolism",
+  "version": "0.2.1",
+  "type": "module",
+  "description": "把每次上下文压缩前的原文归档进本地「茅房」：一天一个文件夹、一行一段，配索引与按时间加权的召回。",
+  "license": "MIT",
+  "author": "长命 (Changming) — 第一作者; 久安 (Jiuan)",
+  "exports": {
+    ".": "./index.js",
+    "./engine": "./engine.js",
+    "./recall": "./recall.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "engine.js",
+    "recall.js",
+    "向量.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "compaction",
+    "context",
+    "archive",
+    "recall",
+    "memory"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^4.3.2"
+  }
+}
