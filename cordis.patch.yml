@@ -1,0 +1,30 @@
+# dsh-metabolism
+#
+# 三个条目，各管一段：
+#   metabolism         归档器：压缩成功后把原文 + 摘要 + 索引落到茅房（宿主平面、纯观察者）
+#   metabolism-engine  压缩器：接管自动压缩（换档改 <数据目录>\代谢日志\开关.json）
+#   metabolism-recall  召回：按关键词/日期从茅房把原文捞回来（metabolism_recall 工具）
+#
+# 注意一：engine 只在运行时开关 takeover=true 时才会去关掉预设里自带的压缩后端。
+# 注意二：这里不写死任何路径。目录按这个顺序找：
+#   1. 插件目录下的 本地配置.json（本机用，不进包）
+#   2. 环境变量 DSH_METABOLISM_HOME
+#   3. profile 目录下的 代谢\茅房
+
+- insert:
+    - id: metabolism
+      name: dsh-metabolism
+      config:
+        enabled: true
+
+    - id: metabolism-engine
+      name: dsh-metabolism/engine
+      config:
+        # 这里只是兜底默认值，真正生效的是 <数据目录>\代谢日志\开关.json
+        takeover: false
+        dryRun: true
+        thresholdTokens: 300000
+        retainTokens: 200000
+
+    - id: metabolism-recall
+      name: dsh-metabolism/recall
