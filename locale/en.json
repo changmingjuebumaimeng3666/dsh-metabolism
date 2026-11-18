@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Metabolism archive",
+    "description": "When the session compacts its context, copy the raw span to a dated archive folder with the summary the model saw, plus an index you can read later.",
+    "detail": "docs/DETAIL.md"
+  }
+}
