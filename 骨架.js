@@ -99,6 +99,11 @@ export function writeL1(options) {
       done: listOf(options.done),
       next: String(options.next ?? '').trim(),
       quotes: listOf(options.quotes),
+      // 提炼闸（2026-11-21）：压缩前抢出来的四类，别让「稍后再说」变成永远不说
+      decisions: listOf(options.decisions),
+      preferences: listOf(options.preferences),
+      promises: listOf(options.promises),
+      threads: listOf(options.threads),
     }
 
     // 守卫（设计稿 v3.1 第四节）：模型写的四要素落盘前过闸。
@@ -141,6 +146,14 @@ export function writeL1(options) {
       '',
       '**原话**',
       card.quotes.length === 0 ? '（没有摘原话）' : card.quotes.map((q) => `- ${q}`).join('\n'),
+      '',
+      section('做过的决定', card.decisions),
+      '',
+      section('新偏好', card.preferences),
+      '',
+      section('答应过还没做', card.promises),
+      '',
+      section('没结的线头', card.threads),
       '',
       `原文：${options.archivePath}（seq ${options.seqFrom}–${options.seqTo}，${Number(options.tokens) || 0} tokens）`,
       '',
