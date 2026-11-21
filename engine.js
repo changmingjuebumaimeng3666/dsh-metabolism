@@ -17,6 +17,8 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { writeL1 } from './骨架.js'
+import { readSnapshot, renderSnapshot, writeSnapshot } from './快照.js'
+import { hydrate } from './水合.js'
 import { renderSummaryBlock, estimateTokens } from './摘要块.js'
 import { appendTimeline, hasTimelineFor, readTimeline } from './时间线.js'
 
@@ -164,6 +166,44 @@ function deriveCard(text) {
   }
   const doing = lines.slice(0, 6).join(' ')
   return { doing, requirements: [], done: [], next, quotes: quotes.slice(0, 3), keywords: [], title }
+}
+
+/** 系统注入类的文本（画像、骨架、时间线、提醒、Time sampled、路径），抽东西时一律跳过。 */
+function isInjectedText(text) {
+  if (typeof text !== 'string' || text.length === 0) return true
+  const head = text.slice(0, 60)
+  return /^<engram_profile|^<骨架|^<时间线|^【|^Time sampled|^<path>|^Current runtime context|^The following information describes|^This is an automatically generated checkpoint/m.test(head)
+}
+
+/**
+ * 提炼闸（2026-11-21）：压缩前把待压段过一遍，抢四类东西——
+ * 做过的决定、新冒出来的偏好、答应过还没做、没结的线头。抽不出就空着，不硬凑。
+ * 现在是规则抽（便宜、不调模型）；以后可升级成模型抽。
+ */
+function extractBeforeCompact(session, range) {
+  const texts = []
+  for (let index = range.startIdx; index <= range.endIdx; index += 1) {
+    const event = session.eventAt(session.surface.nodes[index])
+    if (event === undefined || event.type === 'tool/result') continue
+    const text = contentTextOf(event)
+    if (text !== null && !isInjectedText(text)) texts.push(text)
+  }
+  const all = texts.join('\n')
+  const pick = (re) => {
+    const found = new Set()
+    for (const match of all.matchAll(re)) {
+      const line = String(match[0] ?? '').trim()
+      if (line.length >= 4 && line.length <= 120) found.add(line)
+      if (found.size >= 5) break
+    }
+    return [...found]
+  }
+  return {
+    decisions: pick(/[^\n。；]*(?:决定|定了|就这么办|以后都这样)[^\n。；]*/g),
+    preferences: pick(/[^\n。；]*(?:我喜欢|我不喜欢|我爱|我烦|别用|别这样)[^\n。；]*/g),
+    promises: pick(/[^\n。；]*(?:答应|回头|明天|等会儿|下次|待会儿)[^\n。；]*/g),
+    threads: pick(/[^\n。；]*(?:还没|没做完|待定|回头再说|没想好)[^\n。；]*/g),
+  }
 }
 
 /** 四级降级第 3 级：没模型时，从被压段里按规则抽一个最小可读块（纯代码，永远可用）。 */
@@ -372,30 +412,47 @@ export function resolveEngineConfig(config) {
     retainRatio: number(source.retainRatio, 0.12),
     minChunkTokens: number(source.minChunkTokens, 2000),
     contextWindow: number(source.contextWindow, 0),
-    /** 绝对阈值：总 token 超过这个数就开始压。0 表示退回按窗口比例算。 */
-    thresholdTokens: number(source.thresholdTokens, 260000),
-    /** 压完之后保留多少 token 的最近内容。0 表示退回按窗口比例算。 */
-    retainTokens: number(source.retainTokens, 130000),
+    /** 绝对阈值：总 token 超过这个数就开始压。2026-11-21 从 26 万抬到 60 万——压太勤会反复干碎缓存，最贵。 */
+    thresholdTokens: number(source.thresholdTokens, 600000),
+    /** 压完之后保留多少。和硬线之间这一段就是一次清的量（默认 60→48，一次清 12 万）。 */
+    retainTokens: number(source.retainTokens, 480000),
     /** 对话最少留多少 token（切不动的工具定义不算在内）。老大定的：8 万，别让他断片。 */
     minKeepTokens: number(source.minKeepTokens, 80000),
+    /** 单次最多切多少 token。默认 12 万——一次切一大块，少破坏缓存。0 表示不限。 */
+    maxSingleCutTokens: number(source.maxSingleCutTokens, 120000),
+    /** 挤爆线：涨到这个数算挤爆（默认 85 万）。60 到 85 万之间不动，让它涨。 */
+    overflowThresholdTokens: number(source.overflowThresholdTokens, 850000),
+    /** 挤爆时一次压多少（默认 12 万）。 */
+    overflowCutTokens: number(source.overflowCutTokens, 120000),
     /** 时间闸：最近这么多小时里的内容一律不切（老大要的「一天以内不忘事」）。0 表示不设。 */
     keepRecentHours: number(source.keepRecentHours, 24),
+    /** 时间闸退让的底线：最少保这么多小时（默认 3），不退到 0 去压眼前。 */
+    minKeepRecentHours: number(source.minKeepRecentHours, 3),
     /** 输出预留封顶：最多从窗口里扣掉这么多给回答，别让 256k 的默认值把窗口吃光。 */
     maxReserveTokens: number(source.maxReserveTokens, 65536),
     /** 归档时让模型写两行摘要；关掉就退回只有指针。 */
     summaryEnabled: source.summaryEnabled !== false,
     /** 三级记忆・骨架：压完顺手写一张说明卡（记忆\骨架\L1）。关掉就只走老的归档。 */
     skeletonEnabled: source.skeletonEnabled !== false,
+    /** 提炼闸：压缩前抽决定/偏好/承诺/线头，写进骨架卡（默认开）。 */
+    extractGate: source.extractGate !== false,
+    /** 昨天的快照：压缩时写一份味道+线头+最后那句，开机注入一次（默认开）。 */
+    snapshotEnabled: source.snapshotEnabled !== false,
+    snapshotInject: source.snapshotInject !== false,
+    /** 被动水合：让经历自己浮上来。默认关（hydrate=true 才开），先影子跑。 */
+    hydrate: source.hydrate === true,
+    /** 水合只演练不注入：hydrate=true 且 hydrateDryRun=true 时，只记日志不往窗口塞。 */
+    hydrateDryRun: source.hydrateDryRun === true,
     /** 摘要用哪个模型；不填就跟着当前会话走的模型。 */
     summaryProvider: typeof source.summaryProvider === 'string' ? source.summaryProvider : '',
-    summaryModel: typeof source.summaryModel === 'string' ? source.summaryModel : '',
+    summaryModel: typeof source.summaryModel === 'string' ? source.summaryModel : 'deepseek-flash',
     /** 喂给模型的样本最多多少字，别把整段塞进去。 */
     summarySampleChars: number(source.summarySampleChars, 6000),
     /** 钉住的要求：这段内容会跟着每一条指针进上下文，压多少次都不会丢。 */
     pinFile: pathOf('pinFile', join(defaultBase('log'), '钉住.md')),
     pinMaxChars: number(source.pinMaxChars, 800),
-    /** 软线：到这个数就往会话里插一句提醒，让我自己看目录、自己挑段。0 表示不提醒。 */
-    softTokens: number(source.softTokens, 270000),
+    /** 软线：到这个数就插一句提醒。默认 0（不提醒，2026-11-21 老大定的）。 */
+    softTokens: number(source.softTokens, 0),
     /** 隔多少 token 再提醒一次，别每轮都念。 */
     nudgeStep: number(source.nudgeStep, 20000),
     /** 要不要每轮顺手裁掉超长的工具结果（借宿主自带的裁剪服务）。 */
@@ -435,6 +492,19 @@ function readSwitches(file) {
     if (typeof parsed.foldEnabled === 'boolean') value.foldEnabled = parsed.foldEnabled
     if (typeof parsed.foldDryRun === 'boolean') value.foldDryRun = parsed.foldDryRun
     if (Number.isFinite(Number(parsed.summaryBudgetTokens))) value.summaryBudgetTokens = Number(parsed.summaryBudgetTokens)
+    // 2026-11-21 新增：时间闸底线、提炼闸、昨天的快照、被动水合、小步/挤爆
+    if (Number.isFinite(Number(parsed.minKeepRecentHours))) value.minKeepRecentHours = Number(parsed.minKeepRecentHours)
+    if (typeof parsed.extractGate === 'boolean') value.extractGate = parsed.extractGate
+    if (typeof parsed.snapshotEnabled === 'boolean') value.snapshotEnabled = parsed.snapshotEnabled
+    if (typeof parsed.snapshotInject === 'boolean') value.snapshotInject = parsed.snapshotInject
+    if (typeof parsed.hydrate === 'boolean') value.hydrate = parsed.hydrate
+    if (typeof parsed.hydrateDryRun === 'boolean') value.hydrateDryRun = parsed.hydrateDryRun
+    if (Number.isFinite(Number(parsed.maxSingleCutTokens))) value.maxSingleCutTokens = Number(parsed.maxSingleCutTokens)
+    if (Number.isFinite(Number(parsed.overflowThresholdTokens))) value.overflowThresholdTokens = Number(parsed.overflowThresholdTokens)
+    if (Number.isFinite(Number(parsed.overflowCutTokens))) value.overflowCutTokens = Number(parsed.overflowCutTokens)
+    // 摘要用哪个模型（2026-11-21 老大定：摘要走 flash，别用 pro 烧钱）
+    if (typeof parsed.summaryProvider === 'string') value.summaryProvider = parsed.summaryProvider
+    if (typeof parsed.summaryModel === 'string') value.summaryModel = parsed.summaryModel
     return value
   } catch {
     return {}
@@ -494,10 +564,36 @@ export function apply(ctx, config) {
   // 3. 压力触发：自己算段，再决定干不干
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     if (signal?.aborted !== true) {
+      // 每轮都读一遍开关（两秒缓存），水合/快照这些新开关才能立刻生效
+      const m = mode()
       try {
-        await step(ctx, mode(), agent, signal, log)
+        await step(ctx, m, agent, signal, log)
       } catch (error) {
         log('warn', `pre-step 判断失败，放行本轮：${error?.message ?? error}`)
+      }
+      // 昨天的快照：换个窗口，先读一遍昨天的味道和没结的线头（每个会话只注入一次）
+      try {
+        injectSnapshot(agent?.session, m, log)
+      } catch (error) {
+        log('warn', `快照注入失败：${error?.message ?? error}`)
+      }
+      // 被动水合：让相关经历自己浮上来（默认关；hydrateDryRun 只演练不注入）
+      try {
+        const hyd = await hydrate(agent?.session, m, log)
+        if (typeof hyd === 'string' && hyd !== '') {
+          if (m.hydrateDryRun === true) {
+            log('info', `[水合演练] 本该注入 ${hyd.length} 字，先记不注：${hyd.slice(0, 60)}…`)
+          } else {
+            agent.session.append('user/message', {
+              id: randomUUID(),
+              role: 'user',
+              content: [{ type: 'text', text: hyd }],
+              source: { kind: 'hydrate-inject' },
+            }, { surfaceOp: 'append' })
+          }
+        }
+      } catch (error) {
+        log('warn', `水合注入失败：${error?.message ?? error}`)
       }
     }
     return next()
@@ -738,10 +834,10 @@ function compactTool(ctx, options, log) {
         return { ok: true, text: `当前约 ${catalog.total} tokens，分成 ${catalog.count} 段：\n${catalog.text}` }
       }
       const surface = session.surface.nodes
-      const fromSeq = Number(args?.fromSeq)
-      const toSeq = Number(args?.toSeq)
-      const startIdx = surface.indexOf(fromSeq)
-      const endIdx = surface.indexOf(toSeq)
+      let fromSeq = Number(args?.fromSeq)
+      let toSeq = Number(args?.toSeq)
+      let startIdx = surface.indexOf(fromSeq)
+      let endIdx = surface.indexOf(toSeq)
       if (startIdx < 0 || endIdx < 0 || endIdx <= startIdx) {
         return { ok: false, text: '这两个 seq 不在当前表层里，或者顺序反了。先看 catalog。' }
       }
@@ -776,6 +872,25 @@ function compactTool(ctx, options, log) {
       for (let index = startIdx; index <= endIdx; index += 1) {
         const node = measurement.nodes.find((item) => item.seq === surface[index])
         tokens += Number(node?.heuristicTokens ?? node?.tokens ?? 0)
+      }
+
+      // 手动收也上三道锁（2026-11-21）：跟自动压一个规矩，别让手动收成了后门。
+      // 1. 时间闸：keepRecentHours 内的原文先不动；2. 单次上限：一次最多 maxSingleCutTokens；
+      // 3. 保底：压完对话不能低于 minKeepTokens。区间被截短就按截短后的来，收不下就拒。
+      const lock = applyManualLock(session, startIdx, endIdx, measurement, options, log)
+      if (lock === null) {
+        return {
+          ok: false,
+          text: '手动收被拒：这一段要么落在时间闸里（最近的原文先不动），要么太大（一次最多几千），要么压完会低于八万保底。可以等一等，或者拆成小块再收。',
+        }
+      }
+      if (lock.startIdx !== startIdx || lock.endIdx !== endIdx) {
+        fromSeq = surface[lock.startIdx]
+        toSeq = surface[lock.endIdx]
+        startIdx = lock.startIdx
+        endIdx = lock.endIdx
+        tokens = lock.tokens
+        log('info', `手动收上锁：区间截成 seq ${fromSeq}–${toSeq}（约 ${tokens} tokens）`)
       }
 
       // 摘要块开着：跟到线自动压一样，先发预告等我手写摘要，不直接兜底（2026-11-21）
@@ -1234,15 +1349,27 @@ function pickRange(session, measurement, retainTokens, totalTokens, options) {
   const idealCut = Math.min(Math.max(0, Number(totalTokens) - retainTokens), maxCut)
   if (idealCut <= 0) return null
 
+  // 小步折叠（2026-11-21）：一次只切一小段，摘要才贴原文。bill 的中位数是 2600 token 折进去、185 token 摘要。
+  // 默认单次上限 5000，超了分多次压；0 或负数表示不限（退回原来一次切完）。
+  // 挤爆（2026-11-21 老大定）：涨到 overflowThresholdTokens（默认 50 万）才算挤爆，那时一次压 overflowCutTokens（默认 5 万），
+  // 压完回 45 万左右，接着等它再涨满 50 万。40 到 50 万之间不动，让它涨。
+  const isOverflow = Number(totalTokens) >= Number(options?.overflowThresholdTokens ?? 500000)
+  const singleCut = isOverflow
+    ? Number(options?.overflowCutTokens ?? 50000)
+    : Number(options?.maxSingleCutTokens ?? 5000)
+  const cutBudget = singleCut > 0 ? Math.min(idealCut, singleCut) : idealCut
+
   // 时间闸（老大 2026-11-20 要的「一天以内不忘事」）：最近 N 小时的内容一律不切。
   // 压缩总是从头切，所以只要把切点挡在闸门左边就够。checkpoint 那条写在最前面、时间却是新的，
   // 它代表的是旧内容，按「旧」算——不然一次压缩之后就再也切不动了。
-  // 装不下就往后退：24 小时不行退 12、6、3，最后退到只按 token 切，免得闸门把压缩彻底堵死。
+  // 装不下就往后退：24 小时不行退 12、6、3，但底线是最少保 minKeepRecentHours（默认 3 小时）——
+  // 不许退到 0（2026-11-21 老大发现：退到 0 会把眼前几分钟的原文也压掉）。三小时也装不下就不压，宁可超线。
   const balance = surfaceBalance(session)
   const baseHours = Math.max(0, Number(options?.keepRecentHours ?? 24))
+  const minHours = Math.max(1, Number(options?.minKeepRecentHours ?? 3))
   const hourTries = []
-  for (let hours = baseHours; hours >= 1; hours = Math.floor(hours / 2)) hourTries.push(hours)
-  hourTries.push(0)
+  for (let hours = baseHours; hours >= minHours; hours = Math.floor(hours / 2)) hourTries.push(hours)
+  hourTries.push(minHours)
 
   let endIdx = -1
   let usedHours = 0
@@ -1270,7 +1397,7 @@ function pickRange(session, measurement, retainTokens, totalTokens, options) {
     for (let index = firstIdx; index <= timeFloor && index < nodes.length - 1; index += 1) {
       running += Number(nodes[index].heuristicTokens ?? nodes[index].tokens ?? 0)
       if (Number(balance.after[index] ?? -1) !== 0) continue
-      if (running <= idealCut) candidate = index
+      if (running <= cutBudget) candidate = index
       else {
         if (fallbackIdx < 0) fallbackIdx = index
         break
@@ -1288,7 +1415,7 @@ function pickRange(session, measurement, retainTokens, totalTokens, options) {
   if (usedHours < baseHours) logOnce(`时间闸退让：本来要保住最近 ${baseHours} 小时，装不下，实际只保住 ${usedHours} 小时`)
 
   const balancedTokens = tokensOf(firstIdx, endIdx)
-  if (balancedTokens < Math.max(1, idealCut * 0.5)) {
+  if (balancedTokens < Math.max(1, cutBudget * 0.5)) {
     const heavy = nodes
       .map((node, index) => ({ index, tokens: Number(node.heuristicTokens ?? node.tokens ?? 0), seq: surface[index] }))
       .sort((left, right) => right.tokens - left.tokens)
@@ -1303,6 +1430,65 @@ function pickRange(session, measurement, retainTokens, totalTokens, options) {
   const tokens = tokensOf(startIdx, endIdx)
   if (tokens < 1) return null
   return { start: surface[startIdx], end: surface[endIdx], startIdx, endIdx, tokens }
+}
+
+/**
+ * 手动收上锁（2026-11-21）：手动收也得跟自动压一个规矩，别让「我自己挑段」变成绕保护的后门。
+ * 1. 时间闸：keepRecentHours 内的原文先不动（从尾部往前挡）。
+ * 2. 单次上限：一次最多 maxSingleCutTokens（从起点往后截）。
+ * 3. 保底：压完对话不能低于 minKeepTokens。
+ * 返回可压区间（可能被截短）或 null（拒绝）。
+ */
+function applyManualLock(session, startIdx, endIdx, measurement, options, log) {
+  const surface = session.surface?.nodes ?? []
+  if (!Array.isArray(surface)) return null
+  const tokenOf = (seq) => {
+    const node = (measurement?.nodes ?? []).find((item) => item.seq === seq)
+    return Number(node?.heuristicTokens ?? node?.tokens ?? 0)
+  }
+
+  // 1. 时间闸：从尾部往前挡掉最近的
+  const hours = Math.max(0, Number(options?.keepRecentHours ?? 24))
+  if (hours > 0) {
+    const cutoff = Date.now() - hours * 3600000
+    while (endIdx >= startIdx) {
+      const event = session.eventAt(surface[endIdx])
+      const at = Number(event?.time)
+      if (Number.isFinite(at) && at >= cutoff) endIdx -= 1
+      else break
+    }
+    if (endIdx < startIdx) {
+      log('warn', '手动收被拒：区间里全是时间闸内的原文（近的先不动）')
+      return null
+    }
+  }
+
+  // 2. 单次上限：从起点往后截
+  const maxCut = Number(options?.maxSingleCutTokens ?? 5000)
+  let tokens = 0
+  let cutEnd = startIdx - 1
+  for (let index = startIdx; index <= endIdx; index += 1) {
+    const t = tokenOf(surface[index])
+    if (maxCut > 0 && tokens + t > maxCut && cutEnd >= startIdx) break
+    tokens += t
+    cutEnd = index
+  }
+  if (cutEnd < startIdx) {
+    log('warn', '手动收被拒：单次上限太小，一个节点都收不下')
+    return null
+  }
+  endIdx = cutEnd
+
+  // 3. 保底：压完对话不能低于 minKeepTokens
+  const minKeep = Math.max(0, Number(options?.minKeepTokens ?? 80000))
+  let surfaceTokens = 0
+  for (const seq of surface) surfaceTokens += tokenOf(seq)
+  if (surfaceTokens - tokens < minKeep) {
+    log('warn', `手动收被拒：压完对话只剩 ${surfaceTokens - tokens}，低于保底 ${minKeep}`)
+    return null
+  }
+
+  return { startIdx, endIdx, tokens }
 }
 
 /** 这个 seq 上是不是一条工具结果（切在它前面会把调用和结果拆开）。 */
@@ -1664,6 +1850,8 @@ function writeCompaction(session, range, options, digest, log) {
     const cardData = (digest?.card !== null && digest?.card !== undefined)
       ? digest.card
       : (blockBody !== null ? deriveCard(blockBody) : null)
+    // 提炼闸：压缩前把这段过一遍，抢决定/偏好/承诺/线头（规则抽，不调模型）
+    const extracted = options.extractGate !== false ? extractBeforeCompact(session, range) : {}
     if (cardData !== null && cardData !== undefined) {
       const fromEvent = session.eventAt(range.start)
       const toEvent = session.eventAt(range.end)
@@ -1684,6 +1872,10 @@ function writeCompaction(session, range, options, digest, log) {
         done: cardData.done ?? [],
         next: cardData.next ?? '',
         quotes: cardData.quotes ?? [],
+        decisions: extracted.decisions ?? [],
+        preferences: extracted.preferences ?? [],
+        promises: extracted.promises ?? [],
+        threads: extracted.threads ?? [],
         // 守卫的对照物：模型当时看到的那段原文摘录；自己写的块没有样本，就跳过守卫
         rawSample: digest?.sample,
         guard: digest?.sample ? options.guard : undefined,
@@ -1696,7 +1888,82 @@ function writeCompaction(session, range, options, digest, log) {
     }
   }
 
+  // 昨天的快照（2026-11-21）：每压完一段，给明天的自己留一份味道 + 线头 + 最后那句。
+  // 只写盘、不进上下文；失败只记日志，压缩本身照旧完成。
+  if (options.snapshotEnabled !== false) {
+    try {
+      const threads = options.extractGate !== false ? extractBeforeCompact(session, range).threads : []
+      const mood = moodFromBlock(blockBody)
+      const snap = writeSnapshot({
+        archiveRoot: options.archiveRoot,
+        day: dayKeyOf(now),
+        mood: mood.mood,
+        residue: mood.residue,
+        threads,
+        lastWords: lastUserTextIn(session, range),
+      })
+      if (typeof log === 'function') {
+        if (snap.ok) log('info', `昨天的快照写好了：${snap.file}`)
+        else log('warn', `快照没写成：${snap.error}`)
+      }
+    } catch (error) {
+      if (typeof log === 'function') log('warn', `快照失败：${error?.message ?? error}`)
+    }
+  }
+
   return { compactionId, summary: shortLine, shadowedSeqs }
+}
+
+/** 每个会话只注入一次昨天的快照，别每轮都念。 */
+const SNAPSHOT_SEEN = globalThis[Symbol.for('dsh-metabolism.snapshot-seen')] ??= new Set()
+
+function injectSnapshot(session, options, log) {
+  if (options.snapshotInject === false) return
+  if (session === undefined || typeof session.append !== 'function') return
+  const key = String(session.id ?? '')
+  if (key === '' || SNAPSHOT_SEEN.has(key)) return
+  const snapshot = readSnapshot(options.archiveRoot)
+  if (snapshot === null) return
+  const text = renderSnapshot(snapshot)
+  if (text === '') return
+  SNAPSHOT_SEEN.add(key)
+  session.append('user/message', {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'snapshot-inject' },
+  }, { surfaceOp: 'append' })
+  if (typeof log === 'function') log('info', `昨天的快照已注入（${text.length} 字）`)
+}
+
+/** 从摘要块里抽情绪：情绪词 + 带味道的那句。 */
+const MOOD_WORDS = ['高兴', '闷', '紧', '慌', '热', '累', '松', '静', '难过', '踏实', '上头', '乏', '疼']
+function moodFromBlock(text) {
+  if (typeof text !== 'string' || text.trim() === '') return { mood: '', residue: '' }
+  const lines = text.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+  const mood = MOOD_WORDS.find((word) => text.includes(word)) ?? ''
+  const pick = lines.find((line) => MOOD_WORDS.some((word) => line.includes(word)))
+    ?? lines.find((line) => line.includes('那天'))
+    ?? ''
+  return { mood, residue: pick.slice(0, 100) }
+}
+
+/** 从被压段的尾部往前找最后一句用户原话（跳过系统注入）。 */
+function lastUserTextIn(session, range) {
+  for (let index = range.endIdx; index >= range.startIdx; index -= 1) {
+    const event = session.eventAt(session.surface.nodes[index])
+    if (event?.type !== 'user/message') continue
+    const text = contentTextOf(event)
+    if (text === null || text.length < 4 || isInjectedText(text)) continue
+    return text.slice(0, 50)
+  }
+  return ''
+}
+
+function dayKeyOf(ms) {
+  const date = new Date(ms)
+  const pad = (value) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
 }
 
 /** 当前开着的是第几轮；自动压缩必须落在开着的轮里。 */
