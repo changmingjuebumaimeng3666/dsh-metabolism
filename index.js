@@ -178,6 +178,11 @@ async function archive(root, payload) {
   const times = events.map((event) => Number(event.time)).filter((time) => Number.isFinite(time))
   const startedAt = times.length > 0 ? Math.min(...times) : endedAt
   const finishedAt = times.length > 0 ? Math.max(...times) : endedAt
+  // seq 区间写进摘要头：以后从茅房捞原文，不用先猜它在第几条
+  const seqs = events.map((event) => Number(event.seq)).filter((seq) => Number.isFinite(seq))
+  const seqFrom = seqs.length > 0 ? Math.min(...seqs) : null
+  const seqTo = seqs.length > 0 ? Math.max(...seqs) : null
+  const seqLine = seqFrom === null || seqTo === null ? '(没记到)' : `${seqFrom}–${seqTo}`
 
   const directory = join(root, dayKey(endedAt))
   await mkdir(directory, { recursive: true })
@@ -190,6 +195,10 @@ async function archive(root, payload) {
     events.map((event) => JSON.stringify({ seq: event.seq, type: event.type, time: event.time, data: event.data })).join('\n') + '\n')
 
   const summaryName = `${rawName.slice(0, -'.jsonl'.length)}.summary.md`
+  // 召回命令要用最终文件名，所以放在 rawName 之后才算
+  const recallLine = seqFrom === null || seqTo === null
+    ? '(没有 seq 区间，只能按关键词捞)'
+    : `metabolism_recall(file=${rawName}, fromSeq=${seqFrom}, toSeq=${seqTo})`
   await writeFile(
     join(directory, summaryName),
     [
@@ -197,7 +206,9 @@ async function archive(root, payload) {
       '',
       `- 压缩编号：${compactionId}`,
       `- 覆盖时间：${clockText(startedAt)} – ${clockText(finishedAt)}`,
+      `- seq 区间：${seqLine}`,
       `- 原文：${rawName}`,
+      `- 召回：${recallLine}`,
       `- 事件条数：${events.length}`,
       `- 折算 tokens：${shadowedTokenCount}`,
       `- 摘要模型：${payload.summaryModel || '(未记录)'}`,
