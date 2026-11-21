@@ -1,0 +1,72 @@
+﻿[
+  {
+    "id": "dsh-metabolism@0.2.0",
+    "name": "dsh-metabolism",
+    "version": "0.2.0",
+    "size": 34273,
+    "unpackedSize": 97604,
+    "shasum": "1ab23140425ddda36cf3a07a6a88d20a33cc90df",
+    "integrity": "sha512-wpMETaeLKfJ+LNuptGL6RPYnVYXu9DR/ngtcWmvyaYnBerMFVSflxqpT1Aw0oIpxOXjoox14i7k0qVozQFTdPA==",
+    "filename": "dsh-metabolism-0.2.0.tgz",
+    "files": [
+      {
+        "path": "LICENSE",
+        "size": 1094,
+        "mode": 420
+      },
+      {
+        "path": "向量.js",
+        "size": 6397,
+        "mode": 420
+      },
+      {
+        "path": "cordis.patch.yml",
+        "size": 1169,
+        "mode": 420
+      },
+      {
+        "path": "docs/DETAIL.md",
+        "size": 2593,
+        "mode": 420
+      },
+      {
+        "path": "engine.js",
+        "size": 38622,
+        "mode": 420
+      },
+      {
+        "path": "icon.svg",
+        "size": 639,
+        "mode": 420
+      },
+      {
+        "path": "index.js",
+        "size": 9713,
+        "mode": 420
+      },
+      {
+        "path": "locale/en.json",
+        "size": 257,
+        "mode": 420
+      },
+      {
+        "path": "locale/zh.json",
+        "size": 272,
+        "mode": 420
+      },
+      {
+        "path": "package.json",
+        "size": 961,
+        "mode": 420
+      },
+      {
+        "path": "recall.js",
+        "size": 35887,
+        "mode": 420
+      }
+    ],
+    "entryCount": 11,
+    "bundled": []
+  }
+]
+
