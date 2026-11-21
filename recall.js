@@ -16,17 +16,24 @@
  *
  * @module dsh-metabolism/recall
  */
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, resolve, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { cosineTop, embedTexts, readVectors, vectorsReady, MODEL as VECTOR_MODEL } from './向量.js'
+import { rerankScores } from './重排.js'
+// 骨架工具跟着召回一起挂：同一个 tools 服务，省一条补丁条目（2026-11-19）。
+import { apply as skeletonApply } from './骨架工具.js'
+// 浮现也一起挂：它只要有事件口子，不需要 tools（默认关，开关里打开才动）。
+import { apply as morphApply } from './浮现.js'
+// 贴条（每轮最多一条）：同样只要有事件口子（默认关）。
+import { apply as attachApply } from './贴条.js'
 
 /** 词面与语义各占多少（合起来排位用倒数名次，不看绝对分）。 */
 const RRF_LEXICAL = 1
-const RRF_VECTOR = 0.85
+const RRF_VECTOR = Number(process.env.METAB_RRF_VECTOR ?? localOverrides().rrfVector ?? 1)
 const RRF_K = 60
 /** 只在向量那一路出现的，余弦低于这个就不放进来（避免尾巴上的杂项）。 */
-const VECTOR_ONLY_MIN_COS = 0.36
+const VECTOR_ONLY_MIN_COS = Number(localOverrides().cosMin ?? 0)
 
 /** 常见虚词二元组：这些命中不算数。 */
 const STOP_BIGRAMS = new Set([
@@ -41,6 +48,24 @@ const STOP_CHARS = new Set('的了是在和就都也还把被让给跟吗呢吧�
 
 /** 一条归档里最多收多少字（超长的工具输出只留开头，够检索）。 */
 const MAX_UNIT_CHARS = 20000
+
+/**
+ * 长单元切成小块（2026-11-20）。一整段工具输出或一份评测输出当成一条，
+ * 里面能对上几十个词，会把真答案整个挤下去——线上跑分只有 5/30 就是它干的。
+ * 500 字一块、相邻重叠 100 字，保证跨块的句子还能连上。
+ */
+const CHUNK_CHARS = Math.max(200, Number(localOverrides().chunkChars) || 500)
+const CHUNK_OVERLAP = Math.max(0, Number(localOverrides().chunkOverlap) || 100)
+
+function chunksOf(text) {
+  if (text.length <= CHUNK_CHARS) return [text]
+  const out = []
+  for (let at = 0; at < text.length; at += CHUNK_CHARS - CHUNK_OVERLAP) {
+    out.push(text.slice(at, at + CHUNK_CHARS))
+    if (at + CHUNK_CHARS >= text.length) break
+  }
+  return out
+}
 
 /** 把一句话切成检索用的词：拉丁词按空格，中文按二元组。 */
 export function termsOf(text) {
@@ -255,6 +280,7 @@ export function buildIndex(archiveRoot, indexDir, log = () => {}) {
   if (!existsSync(paths.dir)) mkdirSync(paths.dir, { recursive: true })
   const seen = new Set()
   const lines = []
+  const files = {}
   for (const entry of filesInRange(archiveRoot, null)) {
     let units = []
     try {
@@ -263,24 +289,33 @@ export function buildIndex(archiveRoot, indexDir, log = () => {}) {
       log(`读 ${entry.file} 失败：${error?.message ?? error}`)
       continue
     }
+    try {
+      const stat = statSync(entry.path)
+      files[`${entry.day}/${entry.file}`] = { size: stat.size, mtime: stat.mtimeMs }
+    } catch {
+      // 记不上就记不上，下次全量再来
+    }
     for (const unit of units) {
-      const key = unit.text
-      if (seen.has(key)) continue
-      seen.add(key)
-      const text = unit.text.length > MAX_UNIT_CHARS ? unit.text.slice(0, MAX_UNIT_CHARS) : unit.text
-      lines.push(JSON.stringify({
-        i: lines.length,
-        d: dayOf(unit.time, entry.day),
-        f: entry.file,
-        s: unit.seq,
-        t: unit.time,
-        r: unit.role,
-        n: unit.text.length,
-        x: text,
-      }))
+      for (const piece of chunksOf(unit.text)) {
+        if (seen.has(piece)) continue
+        seen.add(piece)
+        const text = piece.length > MAX_UNIT_CHARS ? piece.slice(0, MAX_UNIT_CHARS) : piece
+        lines.push(JSON.stringify({
+          i: lines.length,
+          d: dayOf(unit.time, entry.day),
+          f: entry.file,
+          s: unit.seq,
+          t: unit.time,
+          r: unit.role,
+          n: piece.length,
+          x: text,
+        }))
+      }
     }
   }
   writeFileSync(paths.file, lines.join('\n'), 'utf8')
+  // 全量建完顺手记一份清单，下次就能走增量
+  writeFileSync(manifestPath(indexDir), JSON.stringify({ version: 1, nextId: lines.length, files }), 'utf8')
   return { units: lines.length }
 }
 
@@ -288,7 +323,113 @@ export function buildIndex(archiveRoot, indexDir, log = () => {}) {
 function indexStale(archiveRoot, indexDir) {
   const paths = indexPaths(indexDir)
   if (!existsSync(paths.file)) return true
-  return newestArchiveMtime(archiveRoot) > statSync(paths.file).mtimeMs
+  const manifest = readManifest(indexDir)
+  if (manifest === null) return newestArchiveMtime(archiveRoot) > statSync(paths.file).mtimeMs
+  const known = manifest.files ?? {}
+  for (const entry of filesInRange(archiveRoot, null)) {
+    const key = `${entry.day}/${entry.file}`
+    let stat
+    try {
+      stat = statSync(entry.path)
+    } catch {
+      continue
+    }
+    const old = known[key]
+    if (old === undefined || old.size !== stat.size) return true
+  }
+  return false
+}
+
+const MANIFEST_FILE = '已收录.json'
+
+function manifestPath(indexDir) {
+  return join(indexDir, MANIFEST_FILE)
+}
+
+function readManifest(indexDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(manifestPath(indexDir), 'utf8'))
+    if (parsed === null || typeof parsed !== 'object') return null
+    if (parsed.files === undefined) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 增量：只把「新落地的归档文件」追加进索引，不重扫全库。
+ *
+ * 老大 2026-11-20 要的：茅房天天涨，每来一个新文件就把 212MB 重读一遍太蠢。
+ * 没有清单或索引不存在时返回 null，调用方退回全量 buildIndex。
+ * 去重只在这一次新增的批内做（跨文件的完全重复留给全量重建清）。
+ */
+export function appendToIndex(archiveRoot, indexDir, log = () => {}) {
+  const paths = indexPaths(indexDir)
+  if (!existsSync(paths.file)) return null
+  const manifest = readManifest(indexDir)
+  if (manifest === null) return null
+
+  const known = manifest.files ?? {}
+  const todo = []
+  const present = new Set()
+  for (const entry of filesInRange(archiveRoot, null)) {
+    const key = `${entry.day}/${entry.file}`
+    present.add(key)
+    let stat
+    try {
+      stat = statSync(entry.path)
+    } catch {
+      continue
+    }
+    const old = known[key]
+    if (old === undefined || old.size !== stat.size) todo.push({ entry, stat, key })
+  }
+
+  // 已经消失的文件从清单里清掉（索引里留着的那几条不动，宁可多不可少）
+  const files = {}
+  for (const [key, value] of Object.entries(known)) if (present.has(key)) files[key] = value
+  for (const item of todo) files[item.key] = { size: item.stat.size, mtime: item.stat.mtimeMs }
+
+  let nextId = Number(manifest.nextId) || 0
+  const lines = []
+  const seen = new Set()
+  for (const { entry } of todo) {
+    let units = []
+    try {
+      units = unitsOfFile(entry.path, entry.day, entry.file)
+    } catch (error) {
+      log(`读 ${entry.file} 失败：${error?.message ?? error}`)
+      continue
+    }
+    for (const unit of units) {
+      for (const piece of chunksOf(unit.text)) {
+        if (seen.has(piece)) continue
+        seen.add(piece)
+        const text = piece.length > MAX_UNIT_CHARS ? piece.slice(0, MAX_UNIT_CHARS) : piece
+        lines.push(JSON.stringify({
+          i: nextId,
+          d: dayOf(unit.time, entry.day),
+          f: entry.file,
+          s: unit.seq,
+          t: unit.time,
+          r: unit.role,
+          n: piece.length,
+          x: text,
+        }))
+        nextId += 1
+      }
+    }
+  }
+
+  if (lines.length > 0) {
+    const current = readFileSync(paths.file)
+    const needsBreak = current.length > 0 && current[current.length - 1] !== 0x0a
+    appendFileSync(paths.file, `${needsBreak ? '\n' : ''}${lines.join('\n')}\n`, 'utf8')
+  }
+
+  writeFileSync(manifestPath(indexDir), JSON.stringify({ version: 1, nextId, files }), 'utf8')
+  return { added: todo.length, units: lines.length }
 }
 
 let cache = null
@@ -342,22 +483,34 @@ function searchIndex(query, options, archiveRoot, indexDir, log) {
   const limit = Math.max(1, Math.min(400, Number(options.pool ?? options.limit) || 5))
   let range = options.from !== undefined || options.to !== undefined
     ? { from: options.from, to: options.to }
-    : parseQueryTime(String(query))
+    : parseQueryTime(String(query), options.now === undefined ? new Date() : new Date(options.now))
   if (range === null && Number(options.days) > 0) range = { from: daysAgoDate(Number(options.days)) }
   const terms = termsOf(query)
   if (terms.length === 0) return { terms, range, scanned: 0, files: 0, hits: [] }
+  // 自指过滤（2026-11-20）：问句本身被归档过（题目文件、以前的提问），检索会把它自己翻出来，
+  // 看着像命中其实是在复述问题。问句够长（≥10 字）且原样出现在条目里就跳过。
+  const rawQuery = String(query).trim()
+  const skipSelfRef = rawQuery.length >= 10
+  // 块边界会把问句截断，整句对不上，所以再拿开头十二个字对一次。
+  const selfPrefix = skipSelfRef ? rawQuery.slice(0, 16) : ''
 
   if (indexStale(archiveRoot, indexDir) && !rebuilding && options.noRebuild !== true) {
     rebuilding = true
-    // 索引旧了：先用旧的答，后台重建一遍（重建期间不接新活）
+    // 索引旧了：先用旧的答，后台补进去（重建期间不接新活）。
+    // 先走增量：只读新落地的归档文件；清单缺失或没底子才退回全量。
     setTimeout(() => {
       try {
         const started = Date.now()
-        const built = buildIndex(archiveRoot, indexDir, log)
+        const added = appendToIndex(archiveRoot, indexDir, log)
         cache = null
-        log(`索引已重建：${built.units} 条，用时 ${Math.round((Date.now() - started) / 1000)}s`)
+        if (added === null) {
+          const built = buildIndex(archiveRoot, indexDir, log)
+          log(`索引已全量重建：${built.units} 条，用时 ${Math.round((Date.now() - started) / 1000)}s`)
+        } else {
+          log(`索引已增量更新：追加 ${added.units} 条（${added.added} 个新文件），用时 ${Math.round((Date.now() - started) / 1000)}s`)
+        }
       } catch (error) {
-        log(`索引重建失败：${error?.message ?? error}`)
+        log(`索引更新失败：${error?.message ?? error}`)
       } finally {
         rebuilding = false
       }
@@ -372,6 +525,12 @@ function searchIndex(query, options, archiveRoot, indexDir, log) {
   const wantsNumber = NUMERIC_Q.test(String(query))
   const K1 = 1.2
   const B = 0.75
+  /** 工具结果权重：默认 0.3。设 1 就不压，设 0 等于一律不看工具输出。 */
+  const TOOL_WEIGHT = options.toolWeight === undefined
+    ? Math.max(0, Number(localOverrides().toolWeight ?? 0.3))
+    : Math.max(0, Number(options.toolWeight))
+  /** 词频封顶：一条里同一个词最多按 8 次算。设 1 就退回「只算有没有出现」的老口径。 */
+  const TF_CAP = Math.max(1, Number(process.env.METAB_TF_CAP) || Number(localOverrides().tfCap) || 8)
 
   const hits = []
   let scanned = 0
@@ -388,12 +547,18 @@ function searchIndex(query, options, archiveRoot, indexDir, log) {
     }
     scanned += 1
     const text = lower[index]
+    if (skipSelfRef && (unit.x.includes(rawQuery) || unit.x.includes(selfPrefix))) continue
+    const lengthNorm = 1 - B + (B * text.length) / avgLen
     let got = 0
     let rareGot = 0
     const matched = []
     for (let k = 0; k < terms.length; k += 1) {
-      if (!text.includes(terms[k])) continue
-      got += weights[k]
+      const at = text.indexOf(terms[k])
+      if (at < 0) continue
+      // 词频：同一个词出现几次就算几次（封顶 TF_CAP，免得一条工具输出靠堆词霸榜）
+      let tf = 0
+      for (let pos = at; pos >= 0 && tf < TF_CAP; pos = text.indexOf(terms[k], pos + terms[k].length)) tf += 1
+      got += weights[k] * ((tf * (K1 + 1)) / (tf + K1 * lengthNorm))
       matched.push(terms[k])
       if (rare[k]) rareGot += weights[k]
     }
@@ -424,10 +589,11 @@ function searchIndex(query, options, archiveRoot, indexDir, log) {
       })
       continue
     }
-    const norm = 1 / (1 + K1 * (1 - B + (B * text.length) / avgLen))
-    const bm25 = got * (1 + K1) * norm
     const rareCoverage = rareTotal > 0 ? rareGot / rareTotal : 1
-    let score = bm25 * rareCoverage
+    let score = got * rareCoverage
+    // 工具结果降权（2026-11-20 量出来的）：前十条里 275 条是工具输出，真答案全被挤下去。
+    // 全部剔掉后三十道题前五全中，所以按权重压着用，不删——万一答案真在工具输出里还捞得到。
+    if (unit.r === '工具') score *= TOOL_WEIGHT
     if (wantsNumber && NUMERIC_DOC.test(unit.x)) score *= 1.35
     score *= recencyFactor(unit.t, options)
     hits.push({
@@ -452,10 +618,16 @@ export function searchArchive(archiveRoot, query, options = {}) {
   const limit = Math.max(1, Math.min(20, Number(options.limit) || 5))
   let range = options.from !== undefined || options.to !== undefined
     ? { from: options.from, to: options.to }
-    : parseQueryTime(String(query))
+    : parseQueryTime(String(query), options.now === undefined ? new Date() : new Date(options.now))
   if (range === null && Number(options.days) > 0) range = { from: daysAgoDate(Number(options.days)) }
   const terms = termsOf(query)
   if (terms.length === 0) return { terms, range, scanned: 0, files: 0, hits: [] }
+  // 自指过滤（2026-11-20）：问句本身被归档过（题目文件、以前的提问），检索会把它自己翻出来，
+  // 看着像命中其实是在复述问题。问句够长（≥10 字）且原样出现在条目里就跳过。
+  const rawQuery = String(query).trim()
+  const skipSelfRef = rawQuery.length >= 10
+  // 块边界会把问句截断，整句对不上，所以再拿开头十二个字对一次。
+  const selfPrefix = skipSelfRef ? rawQuery.slice(0, 16) : ''
 
   const files = filesInRange(archiveRoot, range)
   const hits = []
@@ -464,6 +636,7 @@ export function searchArchive(archiveRoot, query, options = {}) {
     const units = unitsOfFile(entry.path, entry.day, entry.file)
     scanned += units.length
     for (const unit of units) {
+      if (skipSelfRef && (unit.text.includes(rawQuery) || unit.text.includes(selfPrefix))) continue
       const lowered = unit.text.toLowerCase()
       const matched = terms.filter((term) => lowered.includes(term))
       if (matched.length === 0) continue
@@ -516,6 +689,9 @@ async function fuseSemantic(lexical, query, options, dir, archiveRoot, log) {
   const inRange = (row) => {
     const unit = units[row]
     if (unit === undefined) return false
+    // 工具结果不进向量那一路（2026-11-20 量出来的）：词面那路已经把它压到 0.3，
+    // 向量这路要是不管，它又会从后面爬回前排，实测前五反而从 24 掉到 17。
+    if (unit.r === '工具') return false
     if (excluded !== null && excluded.has(unit.f)) return false
     if (range === null || range === undefined) return true
     if (range.from !== undefined && unit.d < range.from) return false
@@ -534,7 +710,7 @@ async function fuseSemantic(lexical, query, options, dir, archiveRoot, log) {
     }
   }
 
-  const pinned = lexical.hits.slice(0, Math.max(0, Math.min(5, Number(options.pinLexical ?? 3)))).filter((hit) => hit.index !== undefined)
+  const pinned = lexical.hits.slice(0, Math.max(0, Math.min(5, Number(options.pinLexical ?? localOverrides().pinLexical ?? 0)))).filter((hit) => hit.index !== undefined)
   const pinnedRows = new Set(pinned.map((hit) => hit.index))
 
   const ranked = new Map()
@@ -598,14 +774,48 @@ export async function search(archiveRoot, query, options = {}, indexDir = undefi
     log(`走索引失败，退回现扫：${error?.message ?? error}`)
     return searchArchive(archiveRoot, query, options)
   }
-  if (options.semantic !== true) {
-    return { ...lexical, semantic: false, hits: lexical.hits.slice(0, Math.max(1, Math.min(20, Number(options.limit) || 5))) }
+  const limit = Math.max(1, Math.min(20, Number(options.limit) || 5))
+  // 要重排就得先把候选捞宽一点：只留 5 条再重排，等于让它在 5 条里换位子，前五永远不变（2026-11-20 踩过）。
+  const wantRerank = options.rerank === true || localOverrides().rerank === true
+  const poolSize = wantRerank ? Math.max(limit, Number(options.rerankTopN ?? localOverrides().rerankTopN ?? 10)) : limit
+  let merged = { ...lexical, semantic: false, hits: lexical.hits.slice(0, poolSize) }
+  if (options.semantic === true) {
+    try {
+      merged = await fuseSemantic(lexical, query, options, dir, archiveRoot, log)
+    } catch (error) {
+      log(`向量那步没成，只按词面答：${error?.message ?? error}`)
+    }
   }
+  const out = await applyRerank(merged, query, options, archiveRoot, log)
+  return { ...out, hits: out.hits.slice(0, limit) }
+}
+
+/**
+ * 重排（2026-11-20）：只动前 rerankTopN 条，拿问题和条目拼起来逐条打分，再按分数重排。
+ * 实测本机一条 0.7 秒，所以默认只排十条，且失败就按原顺序返回，不能让重排把检索拖死。
+ */
+async function applyRerank(merged, query, options, archiveRoot, log) {
+  const cfg = localOverrides()
+  if (options.rerank !== true && cfg.rerank !== true) return merged
+  const topN = Math.max(1, Math.min(30, Number(options.rerankTopN ?? cfg.rerankTopN ?? 10)))
+  const head = merged.hits.slice(0, topN)
+  if (head.length < 2) return merged
   try {
-    return await fuseSemantic(lexical, query, options, dir, archiveRoot, log)
+    const started = Date.now()
+    const scores = await rerankScores(String(query), head.map((hit) => hit.text), resolve(archiveRoot, '..', '..'), {
+      model: options.rerankModel ?? cfg.rerankModel,
+      log,
+    })
+    if (!Array.isArray(scores) || scores.length !== head.length) return merged
+    const ranked = head
+      .map((hit, index) => ({ hit, score: Number(scores[index]) }))
+      .sort((left, right) => right.score - left.score)
+      .map((item) => ({ ...item.hit, rerank: item.score }))
+    log(`重排：前 ${head.length} 条重打分，用时 ${Math.round((Date.now() - started) / 1000)}s`)
+    return { ...merged, rerank: true, hits: [...ranked, ...merged.hits.slice(topN)] }
   } catch (error) {
-    log(`向量那步没成，只按词面答：${error?.message ?? error}`)
-    return { ...lexical, semantic: false, hits: lexical.hits.slice(0, Math.max(1, Math.min(20, Number(options.limit) || 5))) }
+    log(`重排没成，按原顺序答：${error?.message ?? error}`)
+    return merged
   }
 }
 
@@ -684,7 +894,8 @@ export function expandSegment(archiveRoot, options = {}) {
 }
 
 export const name = 'metabolism-recall'
-export const inject = ['tools']
+// llm 是骨架工具回填时用来写卡的（不传就报 cannot get property "llm" without inject）
+export const inject = ['tools', 'llm']
 
 const PARAMETERS = {
   type: 'object',
@@ -802,4 +1013,25 @@ export function apply(ctx, config) {
     return
   }
   ctx.tools.register(definition)
+
+  // 骨架工具同批挂上；它自己挂了也不影响召回
+  try {
+    skeletonApply(ctx, { archiveRoot })
+  } catch (error) {
+    log(`骨架工具没挂上：${error?.message ?? error}`)
+  }
+
+  // 浮现：默认关，开关.json 里 "浮现": true 才注入
+  try {
+    morphApply(ctx, { archiveRoot })
+  } catch (error) {
+    log(`浮现没挂上：${error?.message ?? error}`)
+  }
+
+  // 贴条：默认关，开关.json 里 "每轮一条": true 才动
+  try {
+    attachApply(ctx, { archiveRoot })
+  } catch (error) {
+    log(`贴条没挂上：${error?.message ?? error}`)
+  }
 }
