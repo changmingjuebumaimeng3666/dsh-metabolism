@@ -63,7 +63,7 @@ export async function embedTexts(texts, workspace, options = {}) {
   const prefix = options.query === true ? QUERY_PREFIX : ''
   for (let start = 0; start < texts.length; start += batch) {
     const slice = texts.slice(start, start + batch).map((text) => prefix + String(text).slice(0, MAX_CHARS))
-    const result = await extract(slice, { pooling: 'mean', normalize: true })
+    const result = await extract(slice, { pooling: options.pooling ?? 'mean', normalize: true })
     const flat = result.data
     const dims = result.dims
     for (let row = 0; row < slice.length; row += 1) {
