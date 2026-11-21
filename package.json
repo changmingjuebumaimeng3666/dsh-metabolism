@@ -1,6 +1,6 @@
 {
   "name": "dsh-metabolism",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "上下文代谢：压缩前的原文收进本地「茅房」，窗口里换一块有味道的摘要；七天后折索引，够放就不折，要细节再翻回茅房。",
   "license": "MIT",
@@ -35,6 +35,8 @@
     "守卫.js",
     "摘要块.js",
     "时间线.js",
+    "快照.js",
+    "水合.js",
     "cordis.patch.yml",
     "locale/*.json",
     "docs",
