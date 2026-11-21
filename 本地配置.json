@@ -1,0 +1,11 @@
+{
+    "_说明":  "这台机器的路径覆盖（不进 npm 包）。改完重启 DSH 生效；删掉这个文件就回到按 profile 目录自动算。检索三个旋钮：tfCap=词频封顶（8；设 1 就不算词频）、toolWeight=工具结果权重（0.3）、chunkChars/chunkOverlap=长条目怎么切块（500/100，改这两个要重建索引）。",
+    "archiveRoot":  "D:\\deepseek工作区\\记忆\\茅房",
+    "indexDir":  "D:\\deepseek工作区\\记忆\\茅房索引",
+    "logFile":  "D:\\deepseek工作区\\记忆\\代谢日志\\engine.log",
+    "switchesFile":  "D:\\deepseek工作区\\记忆\\代谢日志\\开关.json",
+    "tfCap":  8,
+    "toolWeight":  0.3,
+    "chunkChars":  500,
+    "chunkOverlap":  100
+}
