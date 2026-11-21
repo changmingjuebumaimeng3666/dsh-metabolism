@@ -28,3 +28,4 @@
 
     - id: metabolism-recall
       name: dsh-metabolism/recall
+      # 骨架工具（metabolism_skeleton）跟着 recall 一起挂，不单列条目
