@@ -210,11 +210,18 @@ export function filesInRange(archiveRoot, range) {
   return files
 }
 
+/** 画像的小节标题——带这些的整段都是画像，不是我们说过的话，一律丢掉。 */
+const PROFILE_MARKERS = /## 硬闸|## 关于 ta|## 相处模式|## 回答规矩|## 语气规矩|## 心情与档位|## 开场规矩|## 接头规矩|## 日志规矩|## 我自己|## 开场三行/
+
 /** 洗一条文字块：剥注入、去重复、压空白。空的不算数。 */
 function cleanText(text) {
   let out = stripInjected(text)
   out = dedupeRepeated(out)
   out = out.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+  // system-reminder 等系统快照的正文残留（标签滤掉后剩下裸正文，旧索引里还有）：整段丢
+  if (/^(Current runtime context|The following information describes|This is an automatically generated checkpoint)/.test(out)) return ''
+  // 画像片段（它作为 user 消息注入过、被归档进了茅房）：带画像小节标题的整段丢
+  if (PROFILE_MARKERS.test(out)) return ''
   return out
 }
 
