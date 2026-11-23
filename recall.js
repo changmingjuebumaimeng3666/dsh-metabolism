@@ -213,6 +213,12 @@ export function filesInRange(archiveRoot, range) {
 /** 画像的小节标题——带这些的整段都是画像，不是我们说过的话，一律丢掉。 */
 const PROFILE_MARKERS = /## 硬闸|## 关于 ta|## 相处模式|## 回答规矩|## 语气规矩|## 心情与档位|## 开场规矩|## 接头规矩|## 日志规矩|## 我自己|## 开场三行/
 
+/** 英文为主的文本（agent 提示词、源码、checkpoint 多是英文）：咱俩的对话是中文，英文一律不进索引。 */
+function isEnglishHeavy(text) {
+  const letters = (String(text).match(/[a-zA-Z]/g) ?? []).length
+  return letters / Math.max(1, String(text).length) > 0.5
+}
+
 /** 洗一条文字块：剥注入、去重复、压空白。空的不算数。 */
 function cleanText(text) {
   let out = stripInjected(text)
@@ -222,6 +228,8 @@ function cleanText(text) {
   if (/^(Current runtime context|The following information describes|This is an automatically generated checkpoint)/.test(out)) return ''
   // 画像片段（它作为 user 消息注入过、被归档进了茅房）：带画像小节标题的整段丢
   if (PROFILE_MARKERS.test(out)) return ''
+  // 英文为主的整段（agent 提示词、源码、checkpoint）：丢
+  if (isEnglishHeavy(out)) return ''
   return out
 }
 
