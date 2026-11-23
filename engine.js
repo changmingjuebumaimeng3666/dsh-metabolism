@@ -13,7 +13,7 @@
  * @module dsh-metabolism/engine
  */
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { writeL1 } from './骨架.js'
@@ -21,6 +21,8 @@ import { readSnapshot, renderSnapshot, writeSnapshot } from './快照.js'
 import { hydrate } from './水合.js'
 import { renderSummaryBlock, estimateTokens } from './摘要块.js'
 import { appendTimeline, hasTimelineFor, readTimeline } from './时间线.js'
+import { unitsOfFile } from './recall.js'
+import { appendRelationship, extractRelationship } from './关系史.js'
 
 /** 本机覆盖：插件目录里的 本地配置.json（不进包，发布版没有这个文件）。 */
 function localOverrides() {
@@ -215,6 +217,10 @@ function deterministicSummary(session, range) {
     if (event === undefined) continue
     const text = contentTextOf(event)
     if (text === null || text.length < 8) continue
+    // 注入、旧摘要块、英文 checkpoint 都不当正文抽
+    if (isInjectedText(text)) continue
+    if (text.startsWith('【这段做了什么】') || text.startsWith('【我们之间】')) continue
+    if ((text.match(/[a-zA-Z]/g) ?? []).length / Math.max(1, text.length) > 0.5) continue
     if (event.type === 'assistant/message' && meLine === '') meLine = text.slice(0, 90)
     if (event.type === 'user/message' && userLine === '' && !text.startsWith('<') && !text.startsWith('【') && !text.startsWith('Time sampled')) userLine = text.slice(0, 60)
     if (meLine !== '' && userLine !== '') break
@@ -443,6 +449,8 @@ export function resolveEngineConfig(config) {
     hydrate: source.hydrate === true,
     /** 水合只演练不注入：hydrate=true 且 hydrateDryRun=true 时，只记日志不往窗口塞。 */
     hydrateDryRun: source.hydrateDryRun === true,
+    /** 关系史：压完抽「我们之间」的关系事件，存成时间线（默认开，只用 flash，几毛钱）。 */
+    relationship: source.relationship !== false,
     /** 摘要用哪个模型；不填就跟着当前会话走的模型。 */
     summaryProvider: typeof source.summaryProvider === 'string' ? source.summaryProvider : '',
     summaryModel: typeof source.summaryModel === 'string' ? source.summaryModel : 'deepseek-flash',
@@ -505,6 +513,8 @@ function readSwitches(file) {
     // 摘要用哪个模型（2026-11-21 老大定：摘要走 flash，别用 pro 烧钱）
     if (typeof parsed.summaryProvider === 'string') value.summaryProvider = parsed.summaryProvider
     if (typeof parsed.summaryModel === 'string') value.summaryModel = parsed.summaryModel
+    // 关系史（2026-11-22）：压完抽「我们之间」的关系事件
+    if (typeof parsed.relationship === 'boolean') value.relationship = parsed.relationship
     return value
   } catch {
     return {}
@@ -579,7 +589,8 @@ export function apply(ctx, config) {
       }
       // 被动水合：让相关经历自己浮上来（默认关；hydrateDryRun 只演练不注入）
       try {
-        const hyd = await hydrate(agent?.session, m, log)
+        const picker = makeHydratePicker(ctx, m, agent?.session, log, 800)
+        const hyd = await hydrate(agent?.session, m, log, picker)
         if (typeof hyd === 'string' && hyd !== '') {
           if (m.hydrateDryRun === true) {
             log('info', `[水合演练] 本该注入 ${hyd.length} 字，先记不注：${hyd.slice(0, 60)}…`)
@@ -620,6 +631,16 @@ export function apply(ctx, config) {
     } catch (error) {
       log('warn', `挂 metabolism_timeline 失败：${error?.message ?? error}`)
     }
+    try {
+      ctx.tools.register(tagTool(ctx, options, log))
+    } catch (error) {
+      log('warn', `挂 metabolism_tag 失败：${error?.message ?? error}`)
+    }
+    try {
+      ctx.tools.register(relationshipTool(ctx, options, log))
+    } catch (error) {
+      log('warn', `挂 metabolism_relationship 失败：${error?.message ?? error}`)
+    }
   }
 }
 
@@ -632,11 +653,11 @@ export function apply(ctx, config) {
 function summarizeTool(ctx, options, log) {
   return {
     name: 'metabolism_summarize',
-    description: '给即将被压掉的那一段写摘要块（500 字左右，叙述式）。不是列条目，是讲故事——连贯地把这段发生了什么、为什么、决定了什么过一遍，带一句我们之间的话（原话摘）和当时什么味，结尾单独留一行「下一步：xxx」。写完引擎就把那段原文换成这块摘要。',
+    description: '给即将被压掉的那一段写摘要块（950–1300 字，叙述式）。不是列条目，是讲故事——连贯地把这段发生了什么、为什么、决定了什么过一遍，带一句我们之间的话（原话摘）和当时什么味，结尾单独留一行「下一步：xxx」。写完引擎就把那段原文换成这块摘要。',
     parameters: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: '摘要块正文，500 字左右，叙述式第一人称：先连贯讲这段发生了什么（做了什么、为什么、决定了什么），带一句我们之间的话和当时什么味；结尾一行「下一步：xxx」。' },
+        text: { type: 'string', description: '摘要块正文，950–1300 字，叙述式第一人称：先连贯讲这段发生了什么（做了什么、为什么、决定了什么），带一句我们之间的话和当时什么味；结尾一行「下一步：xxx」。不够 950 或不超 1300 都不收，打回重写。' },
         mode: { type: 'string', description: '这段是「经历」还是「事实」。passive=经历（我们之间发生了什么、有味道，常驻不折）；active=事实/决定/技术操作（可折成索引按需取）。默认 passive。', enum: ['passive', 'active'] },
         fromSeq: { type: 'integer', description: '可选：要覆盖的起始 seq；不填就用预告里那段。' },
         toSeq: { type: 'integer', description: '可选：要覆盖的结束 seq。' },
@@ -659,8 +680,12 @@ function summarizeTool(ctx, options, log) {
     async execute(args, exec) {
       const session = sessionOf(exec)
       const body = String(args?.text ?? '').trim()
-      if (body.length < 80) {
-        return { ok: false, text: `太短了（${body.length} 字）。摘要块至少要有做什么、为什么、决定、未决、一句话和什么味。` }
+      // 硬性字数：950–1300。不够打回补，超了打回压，都不截断（截了就有内容丢）
+      if (body.length < 950) {
+        return { ok: false, text: `太短了（${body.length} 字）。摘要块要求 950–1300 字，还差 ${950 - body.length} 字，补够再交。` }
+      }
+      if (body.length > 1300) {
+        return { ok: false, text: `太长了（${body.length} 字）。上限 1300 字，超了不收；压到 1300 以内重写，别截断。` }
       }
       const state = readSummaryState(options) ?? {}
       const sameSession = session === undefined || String(state.sessionId ?? '') === String(session.id ?? '')
@@ -732,6 +757,282 @@ function timelineTool(ctx, options, log) {
 /** 从工具调用上下文里找出当前会话；找不到就返回 undefined。 */
 function sessionOf(exec) {
   return exec?.agent?.session ?? exec?.session ?? exec?.context?.session ?? exec?.toolContext?.session
+}
+
+/** 内容哈希（FNV-1a 32 位，跟建向量.mjs 同源）：标签按它存，索引重建也不丢。 */
+function hashOf(text) {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return String(h)
+}
+
+/** 读标签表 { 内容哈希: 标签 }；没有就空。 */
+function readTagMap(options) {
+  const file = join(options.archiveRoot, '..', '茅房索引', '标签.json')
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+/** 写标签表。 */
+function writeTagMap(options, map) {
+  const file = join(options.archiveRoot, '..', '茅房索引', '标签.json')
+  writeFileSync(file, JSON.stringify(map), 'utf8')
+}
+
+/** 打标工具：给索引条目打「经历/技术/闲聊/其他」的标，供水合挑选用。分批跑，标存 记忆\茅房索引\标签.json。 */
+function tagTool(ctx, options, log) {
+  return {
+    name: 'metabolism_tag',
+    description: '给茅房索引条目打标（经历/技术/闲聊/其他），供水合挑选用。分批跑：from/to 是索引范围，batch 每批条数（默认 150）。标签写到 记忆\\茅房索引\\标签.json。',
+    parameters: {
+      type: 'object',
+      properties: {
+        from: { type: 'integer', description: '起始索引（0 基），默认 0。' },
+        to: { type: 'integer', description: '结束索引（不含），默认到结尾。' },
+        batch: { type: 'integer', description: '每批条数，默认 150。' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: { text: { type: 'string', description: '结果。' }, ok: { type: 'boolean', description: '是否成功。' } },
+        required: ['text', 'ok'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '') }],
+    },
+    async execute(args, exec) {
+      const session = sessionOf(exec)
+      // 工具拿的是启动配置，开关得现读一遍，不然 summaryProvider/Model 是空的
+      const m = { ...options, ...readSwitches(options.switchesFile) }
+      const indexFile = join(options.archiveRoot, '..', '茅房索引', '单元.jsonl')
+      const tagFile = join(options.archiveRoot, '..', '茅房索引', '标签.json')
+      const lines = readFileSync(indexFile, 'utf8').split('\n').filter((line) => line.trim() !== '')
+      const total = lines.length
+      const from = Math.max(0, Number(args?.from ?? 0) || 0)
+      const to = Math.min(total, Number(args?.to ?? total) || total)
+      const batch = Math.max(1, Number(args?.batch ?? 150) || 150)
+      let tags = {}
+      try {
+        tags = JSON.parse(readFileSync(tagFile, 'utf8'))
+      } catch {
+        tags = {}
+      }
+      const todo = []
+      for (let index = from; index < to; index += 1) {
+        let unit = null
+        try { unit = JSON.parse(lines[index]) } catch {}
+        const key = unit === null ? `idx${index}` : hashOf(String(unit.x ?? ''))
+        if (tags[key] === undefined) todo.push({ index, key })
+      }
+      if (todo.length === 0) return { ok: true, text: `索引 ${from}–${to} 都打过了（累计 ${Object.keys(tags).length}/${total}）。` }
+      const provider = m.summaryProvider || undefined
+      const model = m.summaryModel || 'deepseek-flash'
+      let done = 0
+      for (let at = 0; at < todo.length; at += batch) {
+        const rows = todo.slice(at, at + batch)
+        const user = rows.map((item) => {
+          try {
+            const unit = JSON.parse(lines[item.index])
+            return `${item.index}. ${String(unit.x ?? '').replace(/\s+/g, ' ').slice(0, 220)}`
+          } catch {
+            return `${item.index}. `
+          }
+        }).join('\n\n')
+        const system = '给下面每条打一个标签，只能从这四个里选一个：经历（两人之间的经历、决定、偏好、情绪时刻）、技术（技术干活、报错、调试、文档、代码）、闲聊（寒暄、废话、天气）、其他。每行输出「编号 标签」，一行一条，不要别的。'
+        const parts = []
+        const types = new Set()
+        let reasoningChars = 0
+        try {
+          const request = {
+            provider,
+            model,
+            messages: [
+              { role: 'system', content: [{ type: 'text', text: system }] },
+              { role: 'user', content: [{ type: 'text', text: user }] },
+            ],
+            maxTokens: 10000,
+            sessionId: session?.id,
+            purpose: 'tag',
+          }
+          const stream = ctx.llm.stream(request)
+          for await (const chunk of stream) {
+            if (typeof chunk?.type === 'string') types.add(chunk.type)
+            if (chunk?.type === 'reasoning-delta' && typeof chunk.text === 'string') reasoningChars += chunk.text.length
+            if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') parts.push(chunk.text)
+            if (chunk?.type === 'finish' && chunk.error !== undefined && chunk.error !== null) throw new Error(String(chunk.error?.message ?? chunk.error))
+          }
+        } catch (error) {
+          log('warn', `打标模型失败：${error?.message ?? error}`)
+          break
+        }
+        const text = parts.join('')
+        if (done === 0) log('info', `打标样本：思考 ${reasoningChars} 字，正文 ${text.length} 字，类型 ${[...types].join(',')}，开头 ${text.slice(0, 120)}`)
+        const byIndex = new Map(rows.map((item) => [item.index, item.key]))
+        for (const line of text.split('\n')) {
+          const match = line.match(/^\s*(\d+)[\s.:：、\-]+(\S+)/)
+          if (match === null) continue
+          const index = Number(match[1])
+          const key = byIndex.get(index)
+          if (key === undefined) continue
+          tags[key] = match[2].slice(0, 6)
+        }
+        done += rows.length
+        try {
+          writeFileSync(tagFile, JSON.stringify(tags), 'utf8')
+        } catch (error) {
+          log('warn', `标签落盘失败：${error?.message ?? error}`)
+        }
+      }
+      const count = Object.keys(tags).length
+      const dist = {}
+      for (const value of Object.values(tags)) dist[value] = (dist[value] ?? 0) + 1
+      return {
+        ok: true,
+        text: `本批 ${done} 条，累计 ${count}/${total}。分布：${Object.entries(dist).map(([k, v]) => `${k} ${v}`).join('，')}。下一批 from=${Math.min(from + done, total)}。`,
+      }
+    },
+  }
+}
+
+/**
+ * 归档后异步打标：把刚落地的归档文件里新单元用 flash 打上标签，存进哈希标签表。
+ * 后台跑（void 调用），失败只记日志，不阻塞压缩。标签跟着新数据自动长，不用再全量补。
+ */
+async function tagNewArchived(ctx, archivePath, day, file, options, session, log) {
+  // 归档文件是另一个监听器晚一步写的，等它落地（最多 30 秒），别急着读
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    if (existsSync(archivePath)) break
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+  }
+  if (!existsSync(archivePath)) {
+    log('warn', `归档打标放弃：${file} 三十秒内没落地`)
+    return
+  }
+  try {
+    const units = unitsOfFile(archivePath, day, file, Number.MAX_SAFE_INTEGER, true)
+      .map((unit) => String(unit?.text ?? '').replace(/\s+/g, ' ').trim())
+      .filter((text) => text.length >= 12)
+    if (units.length === 0) return
+    const tags = readTagMap(options)
+    const todo = []
+    for (const text of units) {
+      const key = hashOf(text)
+      if (tags[key] === undefined) todo.push({ key, text })
+    }
+    if (todo.length === 0) return
+    const m = { ...options, ...readSwitches(options.switchesFile) }
+    const provider = m.summaryProvider || undefined
+    const model = m.summaryModel || 'deepseek-flash'
+    if (provider === undefined) return
+    const batch = 100
+    for (let at = 0; at < todo.length; at += batch) {
+      const rows = todo.slice(at, at + batch)
+      const user = rows.map((item, i) => `${i}. ${item.text.slice(0, 200)}`).join('\n\n')
+      const system = '给下面每条打一个标签，只能从这四个里选一个：经历（两人之间的经历、决定、偏好、情绪时刻）、技术（技术干活、报错、调试、文档、代码）、闲聊（寒暄、废话、天气）、其他。每行输出「编号 标签」，一行一条，不要别的。'
+      const parts = []
+      try {
+        const request = {
+          provider,
+          model,
+          messages: [
+            { role: 'system', content: [{ type: 'text', text: system }] },
+            { role: 'user', content: [{ type: 'text', text: user }] },
+          ],
+          maxTokens: 10000,
+          sessionId: session?.id,
+          purpose: 'tag-archive',
+        }
+        const stream = ctx.llm.stream(request)
+        for await (const chunk of stream) {
+          if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') parts.push(chunk.text)
+          if (chunk?.type === 'finish' && chunk.error !== undefined && chunk.error !== null) throw new Error(String(chunk.error?.message ?? chunk.error))
+        }
+      } catch (error) {
+        log('warn', `归档打标模型失败：${error?.message ?? error}`)
+        break
+      }
+      const text = parts.join('')
+      for (const line of text.split('\n')) {
+        const match = line.match(/^\s*(\d+)[\s.:：、\-]+(\S+)/)
+        if (match === null) continue
+        const idx = Number(match[1])
+        if (idx < 0 || idx >= rows.length) continue
+        tags[rows[idx].key] = match[2].slice(0, 6)
+      }
+      writeTagMap(options, tags)
+    }
+    log('info', `归档打标：${file} 落了 ${todo.length} 条新单元`)
+  } catch (error) {
+    log('warn', `归档打标失败：${error?.message ?? error}`)
+  }
+}
+
+/**
+ * 关系史全量工具：从茅房索引单元里逐条抽「我们之间」的事，存进 记忆\关系史\时间线.jsonl。
+ * 分批跑（断了能接着跑），只读索引、只写关系史，不碰别的。
+ */
+function relationshipTool(ctx, options, log) {
+  return {
+    name: 'metabolism_relationship',
+    description: '全量抽关系史：从茅房索引条目里逐条抽「我们之间」的关系事件（吵架、和好、立规矩、改称呼、试探、放权），存进 记忆\\关系史\\时间线.jsonl。分批跑：from/to 是索引范围，batch 每批条数（默认 60）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        from: { type: 'integer', description: '起始索引（0 基），默认 0。' },
+        to: { type: 'integer', description: '结束索引（不含），默认到结尾。' },
+        batch: { type: 'integer', description: '每批条数，默认 60。' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: { text: { type: 'string', description: '结果。' }, ok: { type: 'boolean', description: '是否成功。' } },
+        required: ['text', 'ok'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '') }],
+    },
+    async execute(args, exec) {
+      const session = sessionOf(exec)
+      const m = { ...options, ...readSwitches(options.switchesFile) }
+      const indexFile = join(options.archiveRoot, '..', '茅房索引', '单元.jsonl')
+      const lines = readFileSync(indexFile, 'utf8').split('\n').filter((line) => line.trim() !== '')
+      const total = lines.length
+      const from = Math.max(0, Number(args?.from ?? 0) || 0)
+      const to = Math.min(total, Number(args?.to ?? total) || total)
+      const batch = Math.max(1, Number(args?.batch ?? 60) || 60)
+      const picker = makeHydratePicker(ctx, m, session, log, 6000)
+      if (typeof picker !== 'function') return { ok: false, text: '没有可用的模型（summaryProvider 空）' }
+      let done = 0
+      let found = 0
+      for (let at = from; at < to; at += batch) {
+        const rows = []
+        for (let i = at; i < Math.min(to, at + batch); i += 1) {
+          try {
+            const unit = JSON.parse(lines[i])
+            const text = String(unit.x ?? '').replace(/\s+/g, ' ').trim()
+            if (text.length >= 12) rows.push(text)
+          } catch {
+            // 行坏了跳过
+          }
+        }
+        if (rows.length === 0) continue
+        const entries = await extractRelationship(rows, picker, log)
+        if (entries.length > 0) found += appendRelationship(options.archiveRoot, entries)
+        done += rows.length
+      }
+      return { ok: true, text: `跑了 ${done} 条，抽到 ${found} 条关系事件，写进 记忆\\关系史\\时间线.jsonl。下一批 from=${to}。` }
+    },
+  }
 }
 
 /** 把表层切成好读的段，给模型挑「留哪段、压哪段」。 */
@@ -877,7 +1178,9 @@ function compactTool(ctx, options, log) {
       // 手动收也上三道锁（2026-11-21）：跟自动压一个规矩，别让手动收成了后门。
       // 1. 时间闸：keepRecentHours 内的原文先不动；2. 单次上限：一次最多 maxSingleCutTokens；
       // 3. 保底：压完对话不能低于 minKeepTokens。区间被截短就按截短后的来，收不下就拒。
-      const lock = applyManualLock(session, startIdx, endIdx, measurement, options, log)
+      // 工具拿的是启动配置，时间闸/上限得现读开关，不然改了不生效
+      const m = { ...options, ...readSwitches(options.switchesFile) }
+      const lock = applyManualLock(session, startIdx, endIdx, measurement, m, log)
       if (lock === null) {
         return {
           ok: false,
@@ -926,7 +1229,7 @@ function compactTool(ctx, options, log) {
       }
       const range = { start: fromSeq, end: toSeq, startIdx, endIdx, tokens }
       const digest = options.summaryEnabled === false ? null : await summarizeWithModel(ctx, options, session, undefined, range, log)
-      const result = writeCompaction(session, range, options, digest, log)
+      const result = writeCompaction(ctx, session, range, options, digest, log)
       log('info', `手动压：seq ${fromSeq}–${toSeq}，${result.shadowedSeqs.length} 条，约 ${tokens} tokens`)
       return { ok: true, text: `压掉了，${result.shadowedSeqs.length} 条原文换成一条指针：${result.summary}` }
     },
@@ -1149,7 +1452,7 @@ async function step(ctx, options, agent, signal, log) {
       digest = { short: summaryShortLine(det), long: det }
     }
   }
-  const result = writeCompaction(session, range, options, digest, log)
+  const result = writeCompaction(ctx, session, range, options, digest, log)
   if (mineText !== '') {
     clearSummaryState(options)
     log('info', `用的是我写的摘要块（${mineText.length} 字）`)
@@ -1744,7 +2047,7 @@ async function flushPendingCompact(ctx, options, session, log) {
         digest = { short: summaryShortLine(det), long: det }
       }
     }
-    const result = writeCompaction(session, range, options, digest, log)
+    const result = writeCompaction(ctx, session, range, options, digest, log)
     if (mineText !== '') {
       clearSummaryState(options)
       log('info', `用的是我写的摘要块（${mineText.length} 字）`)
@@ -1756,7 +2059,7 @@ async function flushPendingCompact(ctx, options, session, log) {
 }
 
 /** 写一次压缩：开锁 → 写摘要 → 替换表层 → 收尾。 */
-function writeCompaction(session, range, options, digest, log) {
+function writeCompaction(ctx, session, range, options, digest, log) {
   // 末端还悬着工具调用时绝不写：新消息会插在调用和结果中间，下一次请求必坏。
   if (!tailBalanced(session)) {
     throw new Error('表层末尾还有没回来的工具调用，这一轮不写压缩（会拆开调用和结果）')
@@ -1773,6 +2076,20 @@ function writeCompaction(session, range, options, digest, log) {
     throw new Error(`压缩终点 seq ${range.end} 后面还有没回的调用，要往前挪`)
   }
   const shadowedSeqs = session.surface.nodes.slice(range.startIdx, range.endIdx + 1)
+  // 关系史：替换前先把待压段里「他 / 我」说的话抽出来（替换后就没了）
+  const relationshipTexts = []
+  if (options.relationship !== false) {
+    let used = 0
+    for (let index = range.startIdx; index <= range.endIdx; index += 1) {
+      const event = session.eventAt(session.surface.nodes[index])
+      const text = contentTextOf(event)
+      if (text === null || isInjectedText(text)) continue
+      if (used + text.length > 6000) break
+      used += text.length
+      relationshipTexts.push(text.slice(0, 500))
+    }
+    if (typeof log === 'function') log('info', `关系史：抽到 ${relationshipTexts.length} 条文本，待抽事件`)
+  }
   const now = Date.now()
   const stamp = new Date(now)
   const pad = (value) => String(value).padStart(2, '0')
@@ -1911,11 +2228,70 @@ function writeCompaction(session, range, options, digest, log) {
     }
   }
 
+  // 关系史：抽「我们之间」的事，存进 记忆\关系史\时间线.jsonl（后台跑，不阻塞压缩，2026-11-22）
+  if (options.relationship !== false && relationshipTexts.length > 0) {
+    try {
+      const picker = makeHydratePicker(ctx, options, session, log)
+      void extractRelationship(relationshipTexts, picker, log)
+        .then((entries) => {
+          if (entries.length > 0) {
+            const count = appendRelationship(options.archiveRoot, entries)
+            log('info', `关系史：抽到 ${count} 条，已存时间线`)
+          }
+        })
+        .catch((error) => log('warn', `关系史存入失败：${error?.message ?? error}`))
+    } catch (error) {
+      log('warn', `关系史触发失败：${error?.message ?? error}`)
+    }
+  }
+
+  // 归档打标：落地的新单元用 flash 打上标签，后台跑，不阻塞压缩（2026-11-22）
+  try {
+    void tagNewArchived(ctx, archivePath, day, `${compactionId}.jsonl`, options, session, log)
+  } catch (error) {
+    log('warn', `归档打标触发失败：${error?.message ?? error}`)
+  }
+
   return { compactionId, summary: shortLine, shadowedSeqs }
 }
 
 /** 每个会话只注入一次昨天的快照，别每轮都念。 */
 const SNAPSHOT_SEEN = globalThis[Symbol.for('dsh-metabolism.snapshot-seen')] ??= new Set()
+
+/**
+ * 水合挑选用的小模型调用：用摘要配置的 flash，别让水合把 pro 拖进来。
+ * 没配好模型就返回 undefined，水合退成「按原顺序取前 3」，不挑。
+ */
+function makeHydratePicker(ctx, options, session, log, maxTokens = 120) {
+  const header = typeof session?.requestHeader === 'function' ? session.requestHeader() : undefined
+  const config = header?.config
+  const provider = options.summaryProvider || config?.provider
+  const model = options.summaryModel || config?.model
+  if (provider === undefined || model === undefined) return undefined
+  return async (system, user) => {
+    const parts = []
+    try {
+      const request = {
+        provider,
+        model,
+        messages: [
+          { role: 'system', content: [{ type: 'text', text: system }] },
+          { role: 'user', content: [{ type: 'text', text: user }] },
+        ],
+        maxTokens,
+        sessionId: session?.id,
+        purpose: 'hydrate-pick',
+      }
+      const stream = ctx.llm.stream(request)
+      for await (const chunk of stream) {
+        if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') parts.push(chunk.text)
+      }
+    } catch (error) {
+      log('warn', `水合挑选模型失败：${error?.message ?? String(error)}`)
+    }
+    return parts.join('')
+  }
+}
 
 function injectSnapshot(session, options, log) {
   if (options.snapshotInject === false) return
@@ -1979,3 +2355,5 @@ function openTurnOf(session) {
 
 // 批量重灌（离线）要用的口子：让脚本能自己挑段、写摘要、替换表层。
 export { writeCompaction, deterministicSummary, summaryShortLine, contentTextOf }
+// 影子测试也要用的口子（只读导出，不改变运行时行为）
+export { pickRange, extractBeforeCompact, buildSample, hashOf, readTagMap, summarizeTool }
