@@ -11,7 +11,6 @@
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { readTimeline } from './时间线.js'
 
 const BUDGET = 1400
 
@@ -56,15 +55,10 @@ function condenseDay(text, limit) {
 
 /** 攒出这一轮要送的文字。 */
 function composeBlock(skeletonDir, archiveRoot, now = Date.now()) {
-  // 最近三条时间线：只给日期加一行标题，让我一开窗就知道这几天在走哪条路
-  const timeline = readTimeline(archiveRoot).slice(0, 3)
+  // 时间线不再读（2026-11-22 老大定）：摘要块已经在上下文里，开窗再给一遍是重复；
+  // 而且时间线只在折叠时补，数据停在旧日期，读出来反而误导。只留最近两天的日摘要。
   const parts = ['<骨架·开窗>', '这是本地骨架上最近两天的摘要，供接头用；细节要翻再调 metabolism_skeleton。']
   let used = parts.join('\n').length
-  if (timeline.length > 0) {
-    const tlBlock = ['<时间线·最近>', ...timeline.map((entry) => `${entry.date ?? '?'} ${entry.title ?? ''}`.trim()), '</时间线·最近>'].join('\n')
-    parts.push(tlBlock)
-    used += tlBlock.length
-  }
   const days = []
   for (let back = 0; back <= 1; back += 1) {
     const d = new Date(now - back * 86400000)
