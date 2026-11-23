@@ -18,7 +18,7 @@ DSH 压缩上下文时，被压掉的那一段会换成一行摘要。摘要写�
 ## 它跟别的压缩插件差在哪
 
 普通的上下文压缩插件靠摘要过日子：压一次，细节糊一层；压到第一百次，剩下的就是一层糊。
-这个插件的压法是**原文进茅房、摘要当路标**——被压掉的那段留一块五百字上下的叙述式摘要，
+这个插件的压法是**原文进茅房、摘要当路标**——被压掉的那段留一块九百五到一千三字的叙述式摘要，
 带一句当时的话和味道；要细节，按地址捞回来就是了。所以压多少次都不糊，也不会有一天「压不动」。
 
 摘要分层：一周以内是事件摘要，七到三十天折成天摘要，三十天外折成一行索引。
@@ -54,14 +54,19 @@ dsh plugin --profile <你的 profile> add dsh-metabolism
 {
   "takeover": true,
   "dryRun": false,
-  "softTokens": 380000,
-  "thresholdTokens": 400000,
-  "retainTokens": 380000,
+  "softTokens": 600000,
+  "nudgeStep": 20000,
+  "thresholdTokens": 650000,
+  "retainTokens": 530000,
+  "minKeepTokens": 80000,
+  "keepRecentHours": 24,
   "summaryBlock": true,
   "summaryWaitMs": 300000,
   "foldEnabled": true,
   "foldDryRun": false,
-  "summaryBudgetTokens": 65000
+  "summaryBudgetTokens": 180000,
+  "relationship": true,
+  "hydrate": true
 }
 ```
 
